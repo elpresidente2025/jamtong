@@ -1,0 +1,191 @@
+name: SEO PR validation
+
+# Fork-only validation. It does not deploy or modify PR #1.
+on:
+  push:
+    branches: [ci/seo-validation-de07857]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'elpresidente2025/jamtong'
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: baseline
+            ref: 8a408928f4ecda791d7926c34322ba96f91b819b
+          - label: candidate
+            ref: de078573a755cbbc5d7d45acae04653a36886c16
+    env:
+      CI: 'true'
+      NEXT_TELEMETRY_DISABLED: '1'
+      NEXT_PUBLIC_SITE_URL: https://jamtong.kr
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.16.0'
+          package-manager-cache: false
+      - name: Install exact package manager and locked dependencies
+        id: install
+        run: |
+          npm install --global pnpm@10.17.1
+          node --version
+          pnpm --version
+          git rev-parse HEAD
+          pnpm install --frozen-lockfile
+      - name: Generate route types
+        id: typegen
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: pnpm exec next typegen
+      - name: Run complete project checks
+        id: check
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: pnpm check
+      - name: Build production application
+        id: build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: pnpm build
+      - name: Verify candidate HTTP output
+        id: http
+        if: ${{ !cancelled() && matrix.label == 'candidate' && steps.build.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          pnpm exec next start --hostname 127.0.0.1 --port 3000 > /tmp/jamtong-server.log 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true; cat /tmp/jamtong-server.log' EXIT
+          ready=0
+          for attempt in $(seq 1 60); do
+            if curl -fsS --max-time 2 http://127.0.0.1:3000/robots.txt > /dev/null; then
+              ready=1
+              break
+            fi
+            kill -0 "$server" || exit 1
+            sleep 1
+          done
+          test "$ready" = 1
+          python3 - <<'PYCODE'
+          """HTTP smoke checks for the built PR, not for the production site."""
+          from html.parser import HTMLParser
+          from urllib.parse import urlsplit
+          from urllib.request import Request, urlopen
+          from urllib.robotparser import RobotFileParser
+          import xml.etree.ElementTree as ET
+
+          ORIGIN = 'https://jamtong.kr'
+          LOCAL = 'http://127.0.0.1:3000'
+
+          class Head(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.canonicals = []
+                  self.directives = []
+                  self.title = ''
+                  self.in_title = False
+              def handle_starttag(self, tag, attrs):
+                  a = dict(attrs)
+                  if tag == 'title':
+                      self.in_title = True
+                  if tag == 'link' and 'canonical' in a.get('rel', '').lower().split():
+                      self.canonicals.append(a.get('href'))
+                  if tag == 'meta' and a.get('name', '').lower() in ('robots', 'googlebot'):
+                      self.directives.extend(a.get('content', '').lower().replace(',', ' ').split())
+              def handle_endtag(self, tag):
+                  if tag == 'title':
+                      self.in_title = False
+              def handle_data(self, data):
+                  if self.in_title:
+                      self.title += data
+
+          def get(path):
+              req = Request(LOCAL + path, headers={'User-Agent': 'Googlebot'})
+              with urlopen(req, timeout=40) as res:
+                  assert res.status == 200, (path, res.status)
+                  assert urlsplit(res.url).netloc == '127.0.0.1:3000', res.url
+                  return res.headers, res.read()
+
+          def validate(fetch):
+              _, raw = fetch('/robots.txt')
+              robots = RobotFileParser()
+              robots.parse(raw.decode().splitlines())
+              for path in ('/my', '/s/daejangdong', '/api/share-card?slug=daejangdong'):
+                  assert robots.can_fetch('Googlebot', LOCAL + path), ('blocked', path)
+              assert ORIGIN + '/sitemap.xml' in (robots.site_maps() or []), 'sitemap directive missing'
+              print('PASS robots: noindex pages and share-card are crawlable')
+
+              _, raw = fetch('/sitemap.xml')
+              root = ET.fromstring(raw)
+              ns = {'s': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+              assert root.tag == '{%s}urlset' % ns['s'], root.tag
+              entries = root.findall('s:url', ns)
+              assert entries, 'empty sitemap'
+              seen = set()
+              for entry in entries:
+                  loc = entry.findtext('s:loc', namespaces=ns)
+                  assert loc and loc not in seen, ('invalid/duplicate loc', loc)
+                  seen.add(loc)
+                  url = urlsplit(loc)
+                  assert url.scheme == 'https' and url.netloc == 'jamtong.kr' and not url.query and not url.fragment, loc
+                  assert url.path not in ('/my', '/wiki/log') and not url.path.startswith('/s/'), loc
+                  if url.path.startswith(('/achievement/', '/words/')):
+                      assert entry.find('s:lastmod', ns) is None, ('event date used as lastmod', loc)
+              assert ORIGIN + '/achievement/daejangdong' in seen
+              print('PASS sitemap: canonical URLs, exclusions, and lastmod policy')
+
+              pages = (
+                  ('/', ORIGIN + '/', False),
+                  ('/achievement/daejangdong?view=full', ORIGIN + '/achievement/daejangdong', False),
+                  ('/my', None, True),
+                  ('/s/daejangdong?view=full', ORIGIN + '/achievement/daejangdong', True),
+              )
+              for path, canonical, noindex in pages:
+                  headers, raw = fetch(path)
+                  assert 'text/html' in headers.get('Content-Type', ''), path
+                  head = Head()
+                  head.feed(raw.decode())
+                  assert head.title.strip(), ('empty title', path)
+                  if canonical is not None:
+                      assert head.canonicals == [canonical], (path, head.canonicals)
+                  directives = head.directives + headers.get('X-Robots-Tag', '').lower().replace(',', ' ').split()
+                  assert ('noindex' in directives) == noindex, (path, directives)
+                  print('PASS HTML metadata:', path)
+
+              headers, raw = fetch('/api/share-card?slug=daejangdong')
+              assert headers.get('Content-Type', '').startswith('image/'), headers
+              assert raw.startswith(b'\x89PNG\r\n\x1a\n'), 'share-card response is not PNG'
+              print('PASS share-card: image still generated')
+
+          if __name__ == '__main__':
+              validate(get)
+          PYCODE
+      - name: Record results and fail on any failed or skipped requirement
+        if: always()
+        env:
+          LABEL: ${{ matrix.label }}
+          REF: ${{ matrix.ref }}
+          INSTALL: ${{ steps.install.outcome }}
+          TYPEGEN: ${{ steps.typegen.outcome }}
+          CHECK: ${{ steps.check.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          HTTP: ${{ steps.http.outcome }}
+        run: |
+          printf '## %s\nCommit: `%s`\n\nInstall: %s\nTypegen: %s\nCheck: %s\nBuild: %s\nHTTP: %s\n' \
+            "$LABEL" "$REF" "$INSTALL" "$TYPEGEN" "$CHECK" "$BUILD" "$HTTP" >> "$GITHUB_STEP_SUMMARY"
+          test "$INSTALL" = success
+          test "$TYPEGEN" = success
+          test "$CHECK" = success
+          test "$BUILD" = success
+          if [ "$LABEL" = candidate ]; then test "$HTTP" = success; fi
