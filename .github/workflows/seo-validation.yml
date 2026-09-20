@@ -21,7 +21,7 @@ jobs:
           - label: baseline
             ref: 8a408928f4ecda791d7926c34322ba96f91b819b
           - label: candidate
-            ref: de078573a755cbbc5d7d45acae04653a36886c16
+            ref: 4faa5bb5441a45aa29ee51407eb9b2649ac80310
     env:
       CI: 'true'
       NEXT_TELEMETRY_DISABLED: '1'
@@ -46,22 +46,18 @@ jobs:
       - name: Generate route types
         id: typegen
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        continue-on-error: true
         run: pnpm exec next typegen
       - name: Run complete project checks
         id: check
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        continue-on-error: true
         run: pnpm check
       - name: Build production application
         id: build
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
-        continue-on-error: true
         run: pnpm build
       - name: Verify candidate HTTP output
         id: http
         if: ${{ !cancelled() && matrix.label == 'candidate' && steps.build.outcome == 'success' }}
-        continue-on-error: true
         shell: bash
         run: |
           pnpm exec next start --hostname 127.0.0.1 --port 3000 > /tmp/jamtong-server.log 2>&1 &
@@ -109,6 +105,10 @@ jobs:
               def handle_data(self, data):
                   if self.in_title:
                       self.title += data
+
+          def canonical_key(value):
+              url = urlsplit(value)
+              return (url.scheme, url.netloc, url.path or '/', url.query, url.fragment)
 
           def get(path):
               req = Request(LOCAL + path, headers={'User-Agent': 'Googlebot'})
@@ -158,7 +158,7 @@ jobs:
                   head.feed(raw.decode())
                   assert head.title.strip(), ('empty title', path)
                   if canonical is not None:
-                      assert head.canonicals == [canonical], (path, head.canonicals)
+                      assert [canonical_key(u) for u in head.canonicals] == [canonical_key(canonical)], (path, head.canonicals)
                   directives = head.directives + headers.get('X-Robots-Tag', '').lower().replace(',', ' ').split()
                   assert ('noindex' in directives) == noindex, (path, directives)
                   print('PASS HTML metadata:', path)
